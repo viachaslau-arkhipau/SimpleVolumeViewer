@@ -15,6 +15,9 @@ class DirectionsNameError(Exception):
 class IndexLimitsNameError(Exception):
     pass
 
+class SpacingValueError(Exception):
+    pass
+
 
 class VolumeStorage:
 
@@ -36,9 +39,97 @@ class VolumeStorage:
         'inferior':  'vertical'
     }
     
+    class Interpolator:
+    
+        approxMatrix = np.array([[-1.,  3., -3.,  1.],
+                                 [ 3., -6.,  3.,  0.],
+                                 [-3.,  0.,  3.,  0.],
+                                 [ 1.,  4.,  1.,  0.]
+                                ]) / 6.
+
+        interpMatrix = np.array([[-1.,  3., -3.,  1.],
+                                 [ 2., -5.,  4., -1.],
+                                 [-1.,  0.,  1.,  0.],
+                                 [ 0.,  2.,  0.,  0.]
+                                ]) / 2.
+
+        linearMatrix = np.array([[0,  0.,  0., 0.],
+                                 [0,  0.,  0., 0.],
+                                 [0, -1.,  1., 0.],
+                                 [0,  1.,  0., 0.]
+                                ])
+
+        @staticmethod
+        def prepareInterpolation(baseNumb, scaleCoef):
+
+            X = np.arange(baseNumb)
+            Y = np.arange(int(baseNumb * scaleCoef)) / scaleCoef
+            Y = Y[Y <= baseNumb - 1]
+            d = baseNumb - 1 - Y[-1]
+            Y += d / 2
+
+            # indices
+            ind = np.zeros((Y.shape[0], 4))
+
+            ind[:, 1] = Y.astype('int')
+            ind[:, 0] = ind[:, 1] - 1
+            ind[:, 2] = ind[:, 1] + 1
+            ind[:, 3] = ind[:, 1] + 2
+
+            ind = np.clip(ind, 0, baseNumb - 1).astype('int')
+
+            # interpolation parameters
+            T = np.zeros((Y.shape[0], 4))
+
+            T[:, 3] = 1.
+            T[:, 2] = Y - ind[:, 1]
+            T[:, 1] = T[:, 2] ** 2
+            T[:, 0] = T[:, 2] ** 3
+
+            return ind.reshape(-1), T
+
+        def __init__(self, vSize, vSpacing, hSize, hSpacing):
+
+            if vSpacing > hSpacing:
+
+                self.horizontalScale = False
+                self.ind, self.T = VolumeStorage.Interpolator.prepareInterpolation(vSize, vSpacing / hSpacing)
+
+            else:
+
+                self.horizontalScale = True
+                self.ind, self.T = VolumeStorage.Interpolator.prepareInterpolation(hSize, hSpacing / vSpacing)
+                
+        def processImage(self, img, interpModel):
+            
+            if self.horizontalScale:
+                I = img.T[self.ind]
+                
+            else:
+                I = img[self.ind]
+                
+            I = I.reshape(-1, 4, I.shape[1])
+                
+            if interpModel == 'L' or interpModel == 'linear':
+                M = self.T @ VolumeStorage.Interpolator.linearMatrix
+                
+            elif interpModel == 'A' or interpModel == 'approximation':
+                M = self.T @ VolumeStorage.Interpolator.approxMatrix
+                
+            elif interpModel == 'I' or interpModel == 'interpolation':
+                M = self.T @ VolumeStorage.Interpolator.interpMatrix
+                
+            result = np.sum((M.reshape(-1) * I.reshape(-1, I.shape[2]).T).T.reshape(-1, 4, I.shape[2]), 1)
+            
+            if self.horizontalScale:
+                result = result.T
+            
+            return result
+            
+    
     class VolumeView:
         
-        def __init__(self, storage, viewDirection, upDirection, verticalFlip = True):
+        def __init__(self, storage, viewDirection, upDirection, verticalFlip = True, interpModel = 'none'):
             
             if not (viewDirection in VolumeStorage.StandartAxisNames.keys() and 
                     upDirection in VolumeStorage.StandartAxisNames.keys()):
@@ -87,8 +178,37 @@ class VolumeStorage:
             self.maxIndex = self.storage.data.shape[self.viewAxisIndex] - 1
             self.setCurrentIndex(self.maxIndex // 2)
             
+            # SPACING
+            vSize    = self.storage.data.shape[self.upAxisIndex]
+            vSpacing = self.storage.spacing[self.upAxisIndex]
+            hSize    = self.storage.data.shape[self.rightAxisIndex]
+            hSpacing = self.storage.spacing[self.rightAxisIndex]
+                
+            # interpolation
+            if not vSpacing == hSpacing:
+                self.interpoalateFlag = True
+                self.interpoalator = VolumeStorage.Interpolator(vSize = vSize, 
+                                                                vSpacing = vSpacing, 
+                                                                hSize = hSize, 
+                                                                hSpacing = hSpacing)
+            else:
+                self.interpoalateFlag = False
+                
+            self.interpModel = interpModel
+                
+        def setInterpolationModel(self, interpModel):
+            self.interpModel = interpModel
+            
+        def getInterpolationModel(self):
+            return self.interpModel
+            
         def transformImage(self, img):
-            return (img.T if self.tranposeFlag else img)[self.slice].copy() 
+            if self.interpoalateFlag and not self.interpModel == 'none':
+                return self.interpoalator.processImage((img.T if self.tranposeFlag else img)[self.slice], 
+                                                        self.interpModel) 
+                
+            else:
+                return (img.T if self.tranposeFlag else img)[self.slice].copy() 
             
         def getIndexLimits(self):
             return self.minIndex, self.maxIndex
@@ -152,8 +272,8 @@ class VolumeStorage:
             return self.transformImage(np.max(self.storage.data, self.viewAxisIndex))
             
     
-    def __init__(self, data, directions = 'left-posterior-superior', 
-                 initStandarView = True, verticalFlip = True):
+    def __init__(self, data, directions = 'left-posterior-superior', spacing = np.ones((3)),
+                 initStandarView = True, verticalFlip = True, interpModel = 'none'):
         
         # DATA
         if not type(data) == np.ndarray:
@@ -161,11 +281,11 @@ class VolumeStorage:
                                 str(type(data)) + " was detected.")
             
         if not len(data.shape) == 3:
-            raise AxesError("Incorrect number of axes. Expected 3, but " +
+            raise AxesError("Incorrect number of data axes. Expected 3, but " +
                                 str(len(data.shape)) + " was detected.")
             
         if data.size == 0:
-            raise EmptyVolumeError("Volume data should be not empty.")
+            raise SpacingValueError("Volume data should be not empty.")
             
         self.data = data.copy()
         
@@ -203,6 +323,21 @@ class VolumeStorage:
             raise DirectionsNameError("Direction names are expected as three words joined by hyphen, ex.: " + 
                                 "\'left-posterior-superior\'.")
             
+        #SPACING
+        if not type(spacing) == np.ndarray:
+            raise DataTypeError("Incorrect spacing data type. Expected <class 'numpy.ndarray'>, but " +
+                                str(type(spacing)) + " was detected.")
+            
+        if not (len(spacing.shape) == 1 and spacing.shape[0] == 3): 
+            raise AxesError("Incorrect spacing geometry. Expected 3 elements along 1 axis, but " +
+                                str(len(spacing.shape)) + " axes with (" + ", ".join(str(a) for a in spacing.shape) +
+                                                                                ") lenghts was detected.")
+            
+        if np.min(spacing) <= 0:
+            raise DataTypeError("Spacing value should be positive number.")
+            
+        self.spacing = spacing.copy()
+        
         # VIEWS
         self.views = {}
         
@@ -211,23 +346,28 @@ class VolumeStorage:
             self.addView('frontal', 
                          viewDirection = 'posterior', 
                          upDirection = 'superior', 
-                         verticalFlip = verticalFlip)
+                         verticalFlip = verticalFlip,
+                         interpModel = interpModel)
             
             self.addView('lateral', 
                          viewDirection = 'right', 
                          upDirection = 'superior', 
-                         verticalFlip = verticalFlip)
+                         verticalFlip = verticalFlip,
+                         interpModel = interpModel)
             
             self.addView('axial', 
                          viewDirection = 'inferior', 
                          upDirection = 'anterior', 
-                         verticalFlip = verticalFlip)
+                         verticalFlip = verticalFlip,
+                         interpModel = interpModel)
+          
 
     def getViews(self):
         return self.views
         
-    def addView(self, name, viewDirection, upDirection, verticalFlip = True):
+    def addView(self, name, viewDirection, upDirection, verticalFlip = True, interpModel = 'none'):
         self.views[name] = VolumeStorage.VolumeView(storage = self, 
                                                     viewDirection = viewDirection, 
                                                     upDirection = upDirection, 
-                                                    verticalFlip = verticalFlip)
+                                                    verticalFlip = verticalFlip,
+                                                    interpModel = interpModel)
